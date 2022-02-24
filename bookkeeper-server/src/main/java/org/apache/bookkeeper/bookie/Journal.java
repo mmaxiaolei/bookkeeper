@@ -492,13 +492,17 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                 try {
                     req = forceWriteRequests.take();
                     // Force write the file and then notify the write completions
-                    //
+                    // 这里大段逻辑主要是做一个优化：当本次执行强制写入的时候，队列中的所有剩余请求都将受益，因此剩余的请求不用实际执行，
+                    // 因此会再队列尾部写入一个标记请求，用来表示队列中标记之前的请求都可以直接跳过(但是会执行回调WriteCallback)
+                    // req.isMarker默认false
                     if (!req.isMarker) {
                         if (shouldForceWrite) {
                             // if we are going to force write, any request that is already in the
                             // queue will benefit from this force write - post a marker prior to issuing
                             // the flush so until this marker is encountered we can skip the force write
+                            // 默认true
                             if (enableGroupForceWrites) {
+                                // 标记请求入队
                                 forceWriteRequests.put(createForceWriteRequest(req.logFile, 0, 0, null, false, true));
                             }
 
@@ -512,6 +516,7 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                             }
                         }
                     }
+                    // 实际执行同步写入和回调
                     numReqInLastForceWrite += req.process(shouldForceWrite);
 
                     if (enableGroupForceWrites
@@ -868,11 +873,15 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
         // Retain entry until it gets written to journal
         entry.retain();
 
+        // 相关统计数据
         journalStats.getJournalQueueSize().inc();
         journalStats.getJournalCbQueueSize().inc();
 
+        // journal内存控制，如果已经使用的内存+当前entry的字节数超过阈值，则会阻塞，等待queue中的entry被刷到journal file后释放内存空间
+        // 默认journal内存限制为(direct memory的5%/journal目录数量)
         memoryLimitController.reserveMemory(entry.readableBytes());
 
+        // 加入到阻塞队列,默认为ArrayBlockingQueue
         queue.put(QueueEntry.create(
                 entry, ackBeforeSync,  ledgerId, entryId, cb, ctx, MathUtils.nowInNano(),
                 journalStats.getJournalAddEntryStats(),
@@ -918,6 +927,7 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
     public void run() {
         LOG.info("Starting journal on {}", journalDirectory);
 
+        // 默认false
         if (conf.isBusyWaitEnabled()) {
             try {
                 CpuAffinity.acquireCore();
@@ -926,14 +936,17 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
             }
         }
 
+        // 相当于ArrayList<QueueEntry>的对象池
         RecyclableArrayList<QueueEntry> toFlush = entryListRecycler.newInstance();
         int numEntriesToFlush = 0;
         ByteBuf lenBuff = Unpooled.buffer(4);
+        // 数据对齐，不够用0补齐
         ByteBuf paddingBuff = Unpooled.buffer(2 * conf.getJournalAlignmentSize());
         paddingBuff.writeZero(paddingBuff.capacity());
 
         BufferedChannel bc = null;
         JournalChannel logFile = null;
+        // 启动同步刷盘(fsync)线程
         forceWriteThread.start();
         Stopwatch journalCreationWatcher = Stopwatch.createUnstarted();
         Stopwatch journalFlushWatcher = Stopwatch.createUnstarted();
@@ -998,6 +1011,10 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                         }
 
                         boolean shouldFlush = false;
+                        // 当出现以下3种情况(非排它)的时候，会强制刷盘：
+                        // 1. 最早加入的entry等待了超过最大等待时间(默认2ms)
+                        // 2. 超过缓冲区最大字节数(默认512KB)或者缓冲区最大entry数量(默认不限制数量)
+                        // 3. flushWhenQueueEmpty为true且队列为空
                         // We should issue a forceWrite if any of the three conditions below holds good
                         // 1. If the oldest pending entry has been pending for longer than the max wait time
                         if (maxGroupWaitInNanos > 0 && !groupWhenTimeout && (MathUtils
@@ -1006,6 +1023,14 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                         } else if (maxGroupWaitInNanos > 0 && groupWhenTimeout
                             && (qe == null // no entry to group
                                 || MathUtils.elapsedNanos(qe.enqueueTime) < maxGroupWaitInNanos)) {
+                            // 这个分支是对情况1的一个细节优化：当最早的entry等待的时间超时的时候，意味着队列(queue)中剩余entry很可能也都超时了。
+                            // (引起超时的原因可能是上一次刷盘写入到文件系统太慢)
+                            // 因此会将队列中已经等待超时的entry都取出来再刷盘
+                            // 判断依据就是最新取出的entry如果等待超时，则先加入到toFlush分组中而不刷盘。
+                            // 循环再从queue中获取entry直到queue为空或者最新取出的entry的等待时间没有超时，
+                            // 则说明所有在队列中已经超时的entry都加入到了本次toFlush分组，本次循环可以刷盘
+                            // 如果没有这段优化，可能会导致toFlush分组中的entry只有1个却频繁刷盘
+
                             // when group timeout, it would be better to look forward, as there might be lots of
                             // entries already timeout
                             // due to a previous slow write (writing to filesystem which impacted by force write).
@@ -1022,7 +1047,7 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                             groupWhenTimeout = false;
                             shouldFlush = true;
                             journalStats.getFlushMaxOutstandingBytesCounter().inc();
-                        } else if (qe == null && flushWhenQueueEmpty) {
+                        } else if (qe == null && flushWhenQueueEmpty) { // flushWhenQueueEmpty默认false
                             // We should get here only if we flushWhenQueueEmpty is true else we would wait
                             // for timeout that would put is past the maxWait threshold
                             // 3. If the queue is empty i.e. no benefit of grouping. This happens when we have one
@@ -1037,9 +1062,11 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                             if (journalFormatVersionToWrite >= JournalChannel.V5) {
                                 writePaddingBytes(logFile, paddingBuff, journalAlignmentSize);
                             }
+                            // 刷盘的一个计时器
                             journalFlushWatcher.reset().start();
                             bc.flush();
 
+                            // 如果配置了非同步刷盘，或者entry设置了在同步刷盘前先ack响应，则优先执行WriteCallback
                             for (int i = 0; i < toFlush.size(); i++) {
                                 QueueEntry entry = toFlush.get(i);
                                 if (entry != null && (!syncData || entry.ackBeforeSync)) {
@@ -1069,6 +1096,10 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                                 .registerSuccessfulValue(batchSize);
 
                             boolean shouldRolloverJournal = (lastFlushPosition > maxJournalSize);
+                            // 触发同步刷盘有以下3种情况：
+                            // 1. journalSyncData设置为true(默认为true)
+                            // 2. journal文件需要轮转的时候(即当前journal文件达到了最大文件size限制)
+                            // 3. 上次同步刷盘的时间距离现在超过了journal刷盘间隔(默认1s同步刷盘一次)
                             // Trigger data sync to disk in the "Force-Write" thread.
                             // Trigger data sync to disk has three situations:
                             // 1. journalSyncData enabled, usually for SSD used as journal storage
@@ -1082,6 +1113,7 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                                     || shouldRolloverJournal
                                     || (System.currentTimeMillis() - lastFlushTimeMs
                                     >= journalPageCacheFlushIntervalMSec)) {
+                                // 同步刷盘通过在一个BlockingQueue(forceWriteRequests)中塞一个请求，另一个线程(forceWriteThread)会不断从这个queue中获取请求去执行同步刷盘，并且执行回调(WriteCallback)
                                 forceWriteRequests.put(createForceWriteRequest(logFile, logId, lastFlushPosition,
                                         toFlush, shouldRolloverJournal, false));
                                 lastFlushTimeMs = System.currentTimeMillis();
@@ -1109,6 +1141,7 @@ public class Journal extends BookieCriticalThread implements CheckpointSource {
                 if (qe == null) { // no more queue entry
                     continue;
                 }
+                // 一些兼容处理
                 if ((qe.entryId == BookieImpl.METAENTRY_ID_LEDGER_EXPLICITLAC)
                         && (journalFormatVersionToWrite < JournalChannel.V6)) {
                     /*

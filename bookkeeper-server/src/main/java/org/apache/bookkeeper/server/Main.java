@@ -204,6 +204,7 @@ public class Main {
         }
     }
 
+    // 启动入口
     public static void main(String[] args) {
         int retCode = doMain(args);
         Runtime.getRuntime().exit(retCode);
@@ -221,6 +222,8 @@ public class Main {
         }
 
         // 1. building the component stack:
+        // 本质是一个LifecycleComponentStack,将多个Component组织成一个栈
+        // 重点关注栈中构建的BookieService这个Component
         LifecycleComponent server;
         try {
             server = buildBookieServer(new BookieConfiguration(conf));

@@ -214,6 +214,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         if (indexDirsManager != ledgerDirsManager) {
             allLedgerDirs.addAll(indexDirsManager.getAllLedgerDirs());
         }
+        // 校验目录结构和文件后缀
         if (metadataDriver == null) { // exists only for testing, just make sure directories are correct
 
             for (File journalDirectory : journalDirectories) {
@@ -226,8 +227,11 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             return;
         }
 
+        // 校验配置的数据目录（journal和ledger）和实际磁盘中的目录是否有出入
+        // 默认需要2者保持完全一致，通过配置allowStorageExpansion=true，允许配置中的目录比实际多（即扩容目录），但是不能比实际目录少(意味着可能丢数据)
         checkEnvironmentWithStorageExpansion(conf, metadataDriver, journalDirectories, allLedgerDirs);
 
+        // 校验是否一个磁盘中有多个数据目录（默认允许这种行为）
         checkIfDirsOnSameDiskPartition(allLedgerDirs);
         checkIfDirsOnSameDiskPartition(journalDirectories);
     }
@@ -243,6 +247,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
      * @throws IOException
      */
     private void checkIfDirsOnSameDiskPartition(List<File> dirs) throws DiskPartitionDuplicationException {
+        // 是否允许一个盘有多个目录，默认true
         boolean allowDiskPartitionDuplication = conf.isAllowMultipleDirsUnderSameDiskPartition();
         final MutableBoolean isDuplicationFoundAndNotAllowed = new MutableBoolean(false);
         Map<FileStore, List<File>> fileStoreDirsMap = new HashMap<FileStore, List<File>>();
@@ -398,6 +403,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             // 3. read the cookie from registration manager. it is the `source-of-truth` of a given bookie.
             //    if it doesn't exist in registration manager, this bookie is a new bookie, otherwise it is
             //    an old bookie.
+            // 从注册中心读取当前bookie的信息(rmCookie)，读取不到说明当前是一个全选的bookie启动
             List<BookieId> possibleBookieIds = possibleBookieIds(conf);
             final Versioned<Cookie> rmCookie = readAndVerifyCookieFromRegistrationManager(
                         masterCookie, rm, possibleBookieIds, allowExpansion);
@@ -410,12 +416,14 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             }
 
             // 4.1 verify the cookies in journal directories
+            // 校验当前配置的journalDirectories是否实际存在磁盘上
             Pair<List<File>, List<Cookie>> journalResult =
                 verifyAndGetMissingDirs(masterCookie,
                                         allowExpansion, journalDirectories);
             missedCookieDirs.addAll(journalResult.getLeft());
             existingCookies.addAll(journalResult.getRight());
             // 4.2. verify the cookies in ledger directories
+            // 校验当前配置的ledgerDirectories是否实际存在磁盘上
             Pair<List<File>, List<Cookie>> ledgerResult =
                 verifyAndGetMissingDirs(masterCookie,
                                         allowExpansion, allLedgerDirs);
@@ -427,6 +435,10 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             //    - new environment
             //    - a directory is being added
             //    - a directory has been corrupted/wiped, which is an error
+            // 如果有存在配置不存在目录（配置存在目录，但是实际没有），则存在以下3中情况：
+            //    - 这是一个全新启动的bookie
+            //    - 新增加了一个目录（allowStorageExpansion必须设置为true）
+            //    - 某个目录顺换或者目录中的数据被擦除(一种异常情况)
             if (!missedCookieDirs.isEmpty()) {
                 if (rmCookie == null) {
                     // 5.1 new environment: all directories should be empty
@@ -672,24 +684,36 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         this.statsLogger = statsLogger;
         this.conf = conf;
         this.journalDirectories = Lists.newArrayList();
+        // 1. 获取配置的journal目录，并在每个journal目录下创建current目录
         for (File journalDirectory : conf.getJournalDirs()) {
             this.journalDirectories.add(getCurrentDirectory(journalDirectory));
         }
+        // 2. 创建磁盘检查：检查每个配置的目录使用量。2个参数：
+        //  * diskUsageThreshold: 默认每个目录最大可以使用磁盘95%的空间。如果所有的ledger目录都超过阈值，bookie将进入只读状态
+        //  * diskUsageWarnThreshold: 磁盘可用空间下限阈值，默认磁盘90%的空间。如果超过这个阈值，将会认为磁盘已满，并触发gc(非jvm gc)来清理数据。
+        //      当发生并发写和数据压缩的时候，这也可以防止bookie频繁在只读和读写状态来回切换
         DiskChecker diskChecker = createDiskChecker(conf);
+        // 3. 创建ledger目录管理
         this.ledgerDirsManager = createLedgerDirsManager(conf, diskChecker, statsLogger.scope(LD_LEDGER_SCOPE));
+        // 4. 创建index目录管理：index目录中是ledger的索引文件，由于ledger目录中所有ledger数据都写在同一个文件中，因此需要索引文件来标识每个ledger数据的offset
+        //      默认直接使用ledger目录
         this.indexDirsManager = createIndexDirsManager(conf, diskChecker, statsLogger.scope(LD_INDEX_SCOPE),
                                                        this.ledgerDirsManager);
         this.writeDataToJournal = conf.getJournalWriteData();
         this.allocator = allocator;
 
         // instantiate zookeeper client to initialize ledger manager
+        // 5. 实例化zk driver，用来操作zk上的bookie元数据
         this.metadataDriver = instantiateMetadataDriver(conf);
+        // 6. 校验环境，主要是配置的数据目录（journal和ledger目录）和磁盘实际存在的目录比较
         checkEnvironment(this.metadataDriver);
         try {
             if (this.metadataDriver != null) {
                 // current the registration manager is zookeeper only
+                // 默认为HierarchicalLedgerManagerFactory
                 ledgerManagerFactory = metadataDriver.getLedgerManagerFactory();
                 LOG.info("instantiate ledger manager {}", ledgerManagerFactory.getClass().getName());
+                // 默认为HierarchicalLedgerManager
                 ledgerManager = ledgerManagerFactory.newLedgerManager();
             } else {
                 ledgerManagerFactory = null;
@@ -704,6 +728,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         // Initialise dirsMonitor. This would look through all the
         // configured directories. When disk errors or all the ledger
         // directories are full, would throws exception and fail bookie startup.
+        // 7. 多个ledger目录的监控包装为dirsMonitor
         List<LedgerDirsManager> dirsManagers = new ArrayList<>();
         dirsManagers.add(ledgerDirsManager);
         if (indexDirsManager != ledgerDirsManager) {
@@ -722,6 +747,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         }
 
         // instantiate the journals
+        // 8. 实例化journals
         journals = Lists.newArrayList();
         for (int i = 0; i < journalDirectories.size(); i++) {
             journals.add(new Journal(i, journalDirectories.get(i),
@@ -731,8 +757,10 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         this.entryLogPerLedgerEnabled = conf.isEntryLogPerLedgerEnabled();
         CheckpointSource checkpointSource = new CheckpointSourceList(journals);
 
+        // 9. 创建ledgerStorage, 默认为SortedLedgerStorage
         ledgerStorage = buildLedgerStorage(conf);
 
+        // 默认false
         boolean isDbLedgerStorage = ledgerStorage instanceof DbLedgerStorage;
 
         /*
@@ -748,6 +776,9 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
          *
          * 2) DbLedgerStorage
          */
+        // LedgerStorage驱动执行checkpoint逻辑，但是有2个例外情况：
+        // 1. entryLogPerLedgerEnabled=true的情况下，有多个entry log，原先基于单个entry log的checkpoint逻辑不适用。因此需要定时的去做checkpoint
+        // 2. DbLedgerStorage
         if (entryLogPerLedgerEnabled || isDbLedgerStorage) {
             syncThread = new SyncThread(conf, getLedgerDirsListener(), ledgerStorage, checkpointSource) {
                 @Override
@@ -768,9 +799,13 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
                 }
             };
         } else {
+            // syncThread用来组织ledgerStorage和journal文件:
+            // 1. 当ledgerStorage.checkpoint()完成后，journal可以安全的删除检查点之前的数据
+            // 2. 装饰ledgerStorage.flush()
             syncThread = new SyncThread(conf, getLedgerDirsListener(), ledgerStorage, checkpointSource);
         }
 
+        // 初始化ledgerStorage
         ledgerStorage.initialize(
             conf,
             ledgerManager,
@@ -783,9 +818,11 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             allocator);
 
 
+        // handle工厂，这个handle是LedgerDescriptorImpl，包装了ledgerStorage，用来读写某个ledgerId对应的ledger的entry
         handles = new HandleFactoryImpl(ledgerStorage);
 
         // Expose Stats
+        // 暴露一些统计指标
         this.bookieStats = new BookieStats(statsLogger);
         journalMemoryMaxStats = new Gauge<Long>() {
             final long journalMaxMemory = conf.getJournalMaxMemorySizeMb() * 1024 * 1024;
@@ -958,15 +995,18 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
 
     @Override
     public synchronized void start() {
+        // 设置为守护线程
         setDaemon(true);
         if (LOG.isDebugEnabled()) {
             LOG.debug("I'm starting a bookie with journal directories {}",
                     journalDirectories.stream().map(File::getName).collect(Collectors.joining(", ")));
         }
         //Start DiskChecker thread
+        // 1. 启动磁盘监控线程
         dirsMonitor.start();
 
         // replay journals
+        // 2. 重放journal.可能这次启动是由于异常情况而重启，journal的数据还未整理刷到ledger
         try {
             readJournal();
         } catch (IOException | BookieException ioe) {
@@ -976,6 +1016,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         }
 
         // Do a fully flush after journal replay
+        // 3. journal重放后，将数据刷盘到ledger,并且会删除journal中已经刷盘的wal日志
         try {
             syncThread.requestFlush().get();
         } catch (InterruptedException e) {
@@ -987,10 +1028,13 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             return;
         }
 
+        // 4. 是否在启动的时候进行一次本地数据一致性检查，默认false.
         if (conf.isLocalConsistencyCheckOnStartup()) {
             LOG.info("Running local consistency check on startup prior to accepting IO.");
             List<LedgerStorage.DetectedInconsistency> errors = null;
             try {
+                // 最终调用的是InterleavedLedgerStorage.localConsistencyCheck(),(和创建bookie服务阶段创建的ScrubberService做的是同一件事)
+                // 仅仅检查写入到EntryLog文件中的entry字节中的元数据（ledgerId、entryId）是否和IndexCache中记录的一致
                 errors = ledgerStorage.localConsistencyCheck(Optional.empty());
             } catch (IOException e) {
                 LOG.error("Got a fatal exception while checking store", e);
@@ -1015,9 +1059,11 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
          * checkpoint which reduce the chance that we need to replay journals
          * again if bookie restarted again before finished journal replays.
          */
+        // 默认空方法，只有在启用多entry log的时候才会启动一个定时checkpoint的任务(详见BookieImpl#795)
         syncThread.start();
 
         // start bookie thread
+        // 5. 启动bookie线程
         super.start();
 
         // After successful bookie startup, register listener for disk
@@ -1027,6 +1073,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
             indexDirsManager.addLedgerDirsListener(getLedgerDirsListener());
         }
 
+        // 6. 启动ledger存储管理
         ledgerStorage.start();
 
         // check the bookie status to start with, and set running.
@@ -1034,6 +1081,7 @@ public class BookieImpl extends BookieCriticalThread implements Bookie {
         // if setting it in bookie thread, the watcher might run before bookie thread.
         stateManager.initState();
 
+        // 7. 将bookie的相关元数据注册到zk以供集群发现
         try {
             stateManager.registerBookie(true).get();
         } catch (Exception e) {

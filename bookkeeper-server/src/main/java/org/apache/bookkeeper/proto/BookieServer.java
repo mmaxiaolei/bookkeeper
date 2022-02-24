@@ -91,6 +91,7 @@ public class BookieServer {
             Supplier<BookieServiceInfo> bookieServiceInfoProvider)
             throws IOException, KeeperException, InterruptedException,
             BookieException, UnavailableException, CompatibilityException, SecurityException {
+        // Main中的调用链路非空
         if (bookieServiceInfoProvider == null) {
             bookieServiceInfoProvider = () -> {
                 try {
@@ -102,6 +103,7 @@ public class BookieServer {
             };
         }
         this.conf = conf;
+        // 1. 校验用户权限: 根据配置判断当前用户名是否允许运行bookkeeper
         validateUser(conf);
         String configAsString;
         try {
@@ -111,9 +113,12 @@ public class BookieServer {
             LOG.error("Got ParseJsonException while converting Config to JSONString", pe);
         }
 
+        // 2. 创建内存分配器，用的netty的包
         ByteBufAllocator allocator = getAllocator(conf);
         this.statsLogger = statsLogger;
+        // 3. 创建bookie的netty服务端
         this.nettyServer = new BookieNettyServer(this.conf, null, allocator);
+        // 4. 创建bookie实例
         try {
             this.bookie = newBookie(conf, allocator, bookieServiceInfoProvider);
         } catch (IOException | KeeperException | InterruptedException | BookieException e) {
@@ -121,6 +126,7 @@ public class BookieServer {
             this.nettyServer.shutdown();
             throw e;
         }
+        // 5. 设置netty服务端的请求处理器(RequestProcessor)
         final SecurityHandlerFactory shFactory;
 
         shFactory = SecurityProviderFactoryFactory
@@ -151,6 +157,7 @@ public class BookieServer {
     }
 
     public void start() throws InterruptedException {
+        // 1. 启动bookie
         this.bookie.start();
         // fail fast, when bookie startup is not successful
         if (!this.bookie.isRunning()) {
@@ -158,6 +165,7 @@ public class BookieServer {
             this.requestProcessor.close();
             return;
         }
+        // 2. 启动netty
         this.nettyServer.start();
 
         running = true;
@@ -165,6 +173,7 @@ public class BookieServer {
         if (null != uncaughtExceptionHandler) {
             deathWatcher.setUncaughtExceptionHandler(uncaughtExceptionHandler);
         }
+        // 3. 启动一个用来检测bookie和netty服务是否存活的线程
         deathWatcher.start();
 
         // fixes test flappers at random places until ISSUE#1400 is resolved
@@ -309,9 +318,13 @@ public class BookieServer {
 
     private ByteBufAllocator getAllocator(ServerConfiguration conf) {
         return ByteBufAllocatorBuilder.create()
+                // 内存分配策略,默认PoolingPolicy.PooledDirect,即使用堆外内存
                 .poolingPolicy(conf.getAllocatorPoolingPolicy())
+                // 内存分配池的并发数，默认2*cpu核数
                 .poolingConcurrency(conf.getAllocatorPoolingConcurrency())
+                // 内存分配器oom的策略：默认为OutOfMemoryPolicy.FallbackToHeap,即当堆外内存分配oom的时候，退化为使用堆内内存
                 .outOfMemoryPolicy(conf.getAllocatorOutOfMemoryPolicy())
+                // oom时候的listener，打印error日志
                 .outOfMemoryListener((ex) -> {
                     try {
                         LOG.error("Unable to allocate memory, exiting bookie", ex);
@@ -321,6 +334,7 @@ public class BookieServer {
                         }
                     }
                 })
+                // 内存泄露检测策略，默认禁用
                 .leakDetectionPolicy(conf.getAllocatorLeakDetectionPolicy())
                 .build();
     }

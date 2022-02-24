@@ -82,6 +82,7 @@ public class SortedLedgerStorage
                            ByteBufAllocator allocator)
             throws IOException {
 
+        // 组合了一个interleavedLedgerStorage,这个ledgerStorage是将所有entry写到同单个entry log文件中（保障了顺序写）
         interleavedLedgerStorage.initializeWithEntryLogListener(
             conf,
             ledgerManager,
@@ -99,6 +100,7 @@ public class SortedLedgerStorage
         if (conf.isEntryLogPerLedgerEnabled()) {
             this.memTable = new EntryMemTableWithParallelFlusher(conf, checkpointSource, statsLogger);
         } else {
+            // entry的内存表，数据总是先写到内存表，后面再异步刷到磁盘
             this.memTable = new EntryMemTable(conf, checkpointSource, statsLogger);
         }
         this.scheduler = Executors.newSingleThreadScheduledExecutor(
