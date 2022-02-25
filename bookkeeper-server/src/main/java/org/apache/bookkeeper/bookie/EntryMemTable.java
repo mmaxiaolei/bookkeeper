@@ -153,6 +153,7 @@ public class EntryMemTable implements AutoCloseable{
     }
 
     Checkpoint snapshot() throws IOException {
+        // max表示将当前内存表(kvmap)中的所有数据创建为快照
         return snapshot(Checkpoint.MAX);
     }
 
@@ -300,14 +301,26 @@ public class EntryMemTable implements AutoCloseable{
         long startTimeNanos = MathUtils.nowInNano();
         boolean success = false;
         try {
+            // 判断内存表的缓存的数据是否达到限制(默认64MB)，如果达到限制，会回调SortedLedgerStorage去执行数据刷盘任务
+            // 添加entry之前先判断是否达到了刷盘条件：
+            // 1. 当前内存表的size是否超过了最大限制(默认64MB)
+            // 2. 上一次刷盘是否成功
             if (isSizeLimitReached() || (!previousFlushSucceeded.get())) {
+                // 如果达到刷盘条件，创建当前整个内存表数据的快照
                 Checkpoint cp = snapshot();
+                // 这里有几种情况：
+                // 1. 如果cp!=null说明当前内存表有最新数据，继续回调触发刷盘任务
+                // 2. 如果cp==null，说明当前内存表没有最新数据，需要进一步判断上次刷盘是否成功
+                //      2.1 如果上一次刷盘成功，那就意味着当前快照和内存表中都没有数据，因此不用触发刷盘任务
+                //      2.2 如果上一次刷盘没有成功(可能是上一次刷盘还未完成也可能是刷盘失败)，继续发布刷盘任务直到成功
                 if ((null != cp) || (!previousFlushSucceeded.get())) {
+                    // 这里的callback会调用this.flush()
                     cb.onSizeLimitReached(cp);
                 }
             }
 
             final int len = entry.remaining();
+            // 利用信号量来限制瞬时大流量导致数据超过内存表数据量限制
             if (!skipListSemaphore.tryAcquire(len)) {
                 memTableStats.getThrottlingCounter().inc();
                 final long throttlingStartTimeNanos = MathUtils.nowInNano();
@@ -316,8 +329,10 @@ public class EntryMemTable implements AutoCloseable{
                     .registerSuccessfulEvent(MathUtils.elapsedNanos(throttlingStartTimeNanos), TimeUnit.NANOSECONDS);
             }
 
+            // 这里的读写锁主要是为了保护kvmap，即entry实际存储的内存结构，一个ConcurrentSkipListMap
             this.lock.readLock().lock();
             try {
+                // 用内存分配器分配堆外内存来缓存数据，如果堆外内存不够，则会退化为直接使用堆内内存
                 EntryKeyValue toAdd = cloneWithAllocator(ledgerId, entryId, entry);
                 size = internalAdd(toAdd);
             } finally {
@@ -343,6 +358,7 @@ public class EntryMemTable implements AutoCloseable{
     */
     private long internalAdd(final EntryKeyValue toAdd) throws IOException {
         long sizeChange = 0;
+        // entry存到kvmap(ConcurrentSkipListMap)
         if (kvmap.putIfAbsent(toAdd, toAdd) == null) {
             sizeChange = toAdd.getLength();
             size.addAndGet(sizeChange);

@@ -179,7 +179,9 @@ public class SortedLedgerStorage
         long entryId = entry.getLong(entry.readerIndex() + 8);
         long lac = entry.getLong(entry.readerIndex() + 16);
 
+        // 数据写入到memTable
         memTable.addEntry(ledgerId, entryId, entry.nioBuffer(), this);
+        // 更新ledgerCache中的lac
         interleavedLedgerStorage.ledgerCache.updateLastAddConfirmed(ledgerId, lac);
         return entryId;
     }
